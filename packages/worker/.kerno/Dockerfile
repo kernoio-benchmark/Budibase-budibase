@@ -5,6 +5,7 @@ LABEL com.centurylinklabs.watchtower.lifecycle.pre-update="scripts/watchtower-ho
 LABEL com.centurylinklabs.watchtower.lifecycle.post-update="scripts/watchtower-hooks/post-update.sh"
 LABEL com.centurylinklabs.watchtower.lifecycle.post-check="scripts/watchtower-hooks/post-check.sh"
 
+
 # handle node-gyp
 RUN apk add --no-cache --virtual .gyp python3 make g++ \
     && apk add --no-cache \
@@ -24,11 +25,14 @@ RUN yarn global add pm2
 
 WORKDIR /app
 
-# Copy package files first for better layer caching
+# Copy package.json for dependency installation
 COPY package.json ./
 
+# Create a minimal yarn.lock
+RUN echo '# yarn lockfile v1' > yarn.lock
+
 ARG TARGETPLATFORM
-RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production 2>/dev/null || echo "No dependencies to install"
+RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production
 
 # Remove unneeded data from file system to reduce image size
 RUN apk del .gyp \
@@ -36,8 +40,10 @@ RUN apk del .gyp \
 
 # Copy application files
 COPY dist ./dist
-COPY docker_run.sh pm2.config.js ./
-RUN chmod +x docker_run.sh
+COPY docker_run.sh ./
+COPY pm2.config.js ./
+
+RUN chmod +x ./docker_run.sh
 
 EXPOSE 4001
 
@@ -52,8 +58,10 @@ ENV SERVICE=worker-service
 ENV POSTHOG_TOKEN=phc_bIjZL7oh2GEUd2vqvTBH8WvrX0fWTFQMs6H5KQxiUxU
 ENV ACCOUNT_PORTAL_URL=https://account.budibase.app
 
-ARG BUDIBASE_VERSION=0.0.0
-ARG GIT_COMMIT_SHA=unknown
+ARG BUDIBASE_VERSION=1.0.0
+ARG GIT_COMMIT_SHA
+# Ensuring the version argument is sent
+RUN test -n "$BUDIBASE_VERSION"
 ENV BUDIBASE_VERSION=$BUDIBASE_VERSION
 ENV DD_GIT_REPOSITORY_URL=https://github.com/budibase/budibase
 ENV DD_GIT_COMMIT_SHA=$GIT_COMMIT_SHA

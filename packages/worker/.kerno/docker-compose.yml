@@ -61,6 +61,7 @@ services:
         LABEL com.centurylinklabs.watchtower.lifecycle.post-update="scripts/watchtower-hooks/post-update.sh"
         LABEL com.centurylinklabs.watchtower.lifecycle.post-check="scripts/watchtower-hooks/post-check.sh"
 
+
         # handle node-gyp
         RUN apk add --no-cache --virtual .gyp python3 make g++ \
             && apk add --no-cache \
@@ -76,38 +77,53 @@ services:
                 less \
                 coreutils \
                 tzdata
-        RUN yarn global add pm2
+        RUN yarn global add pm2 typescript
+
+        WORKDIR /
+
+        COPY scripts/removeWorkspaceDependencies.sh scripts/removeWorkspaceDependencies.sh
+        RUN chmod +x ./scripts/removeWorkspaceDependencies.sh
 
         WORKDIR /app
+        COPY packages/worker/package.json .
+        
+        # Create a minimal yarn.lock
+        RUN echo '# yarn lockfile v1' > yarn.lock
 
-        # Copy package files first for better layer caching
-        COPY packages/worker/package.json ./
+        # Don't remove workspace dependencies - we need them
+        # RUN ../scripts/removeWorkspaceDependencies.sh package.json
 
         ARG TARGETPLATFORM
-        RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production 2>/dev/null || echo "No dependencies to install"
-
+        
+        # Copy workspace dependencies that are referenced
+        COPY packages/backend-core /packages/backend-core
+        COPY packages/types /packages/types
+        COPY packages/shared-core /packages/shared-core
+        COPY packages/pro /packages/pro
+        COPY packages/string-templates /packages/string-templates
+        
+        # Install all dependencies including dev dependencies for build
+        RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install
+        
+        # Copy source files
+        COPY packages/worker/src ./src
+        COPY packages/worker/tsconfig*.json ./
+        
+        # Build with esbuild for simpler compilation
+        RUN yarn add -D esbuild && \
+            npx esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.js --external:@budibase/* --external:koa --external:koa-* --external:passport-* --external:bull --external:dd-trace --external:pouchdb* --external:nodemailer --external:aws-sdk --external:bcrypt --external:jsonwebtoken --external:knex --external:global-agent --external:http-graceful-shutdown --external:ical-generator --external:joi --external:lodash --external:marked --external:node-fetch --external:scim* --external:server-destroy --external:undici --external:uuid --external:yaml --target=es2020
+        
+        # Now reinstall only production dependencies
+        RUN yarn install --production --force
+        
         # Remove unneeded data from file system to reduce image size
         RUN apk del .gyp \
             && yarn cache clean
 
-        # Create stub dist directory and minimal application
-        # NOTE: This is a stub - the real application requires pre-built artifacts from the monorepo build pipeline
-        RUN mkdir -p dist && \
-            echo 'console.log("Budibase Worker Service - Stub Mode");' > dist/index.js && \
-            echo 'console.log("Database:", process.env.POSTGRES_HOST);' >> dist/index.js && \
-            echo 'console.log("Redis:", process.env.REDIS_URL);' >> dist/index.js && \
-            echo 'console.log("JWT Secret configured:", !!process.env.JWT_SECRET);' >> dist/index.js && \
-            echo 'const http = require("http");' >> dist/index.js && \
-            echo 'const server = http.createServer((req, res) => {' >> dist/index.js && \
-            echo '  res.writeHead(200, {"Content-Type": "application/json"});' >> dist/index.js && \
-            echo '  res.end(JSON.stringify({status: "stub", service: "worker"}));' >> dist/index.js && \
-            echo '});' >> dist/index.js && \
-            echo 'server.listen(4001, "0.0.0.0", () => console.log("Stub server listening on port 4001"));' >> dist/index.js
-
-        # Create stub docker_run.sh
-        RUN echo '#!/bin/sh' > docker_run.sh && \
-            echo 'node dist/index.js' >> docker_run.sh && \
-            chmod +x docker_run.sh
+        COPY packages/worker/docker_run.sh .
+        COPY packages/server/pm2.config.js .
+        
+        RUN chmod +x ./docker_run.sh
 
         EXPOSE 4001
 
@@ -122,8 +138,10 @@ services:
         ENV POSTHOG_TOKEN=phc_bIjZL7oh2GEUd2vqvTBH8WvrX0fWTFQMs6H5KQxiUxU
         ENV ACCOUNT_PORTAL_URL=https://account.budibase.app
 
-        ARG BUDIBASE_VERSION=0.0.0
-        ARG GIT_COMMIT_SHA=unknown
+        ARG BUDIBASE_VERSION=1.0.0
+        ARG GIT_COMMIT_SHA
+        # Ensuring the version argument is sent
+        RUN test -n "$BUDIBASE_VERSION"
         ENV BUDIBASE_VERSION=$BUDIBASE_VERSION
         ENV DD_GIT_REPOSITORY_URL=https://github.com/budibase/budibase
         ENV DD_GIT_COMMIT_SHA=$GIT_COMMIT_SHA
@@ -140,4 +158,4 @@ services:
     ports:
       - "4001"
     labels:
-      - jwt-signing-config=HS256:this_is_a_secret_meeting_all_requirements_of_any_hs_algorithms
+      - jwt-signing-config=HS256:${JWT_SECRET}
