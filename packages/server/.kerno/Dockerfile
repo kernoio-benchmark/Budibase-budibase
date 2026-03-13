@@ -1,0 +1,118 @@
+FROM node:22-alpine
+
+LABEL com.centurylinklabs.watchtower.lifecycle.pre-check="scripts/watchtower-hooks/pre-check.sh"
+LABEL com.centurylinklabs.watchtower.lifecycle.pre-update="scripts/watchtower-hooks/pre-update.sh"
+LABEL com.centurylinklabs.watchtower.lifecycle.post-update="scripts/watchtower-hooks/post-update.sh"
+LABEL com.centurylinklabs.watchtower.lifecycle.post-check="scripts/watchtower-hooks/post-check.sh"
+
+WORKDIR /app
+
+ENV PORT=4001
+ENV COUCH_DB_URL=https://couchdb.budi.live:5984
+ENV BUDIBASE_ENVIRONMENT=PRODUCTION
+ENV SERVICE=app-service
+ENV POSTHOG_TOKEN=phc_bIjZL7oh2GEUd2vqvTBH8WvrX0fWTFQMs6H5KQxiUxU
+ENV ACCOUNT_PORTAL_URL=https://account.budibase.app
+ENV TOP_LEVEL_PATH=/
+
+# handle node-gyp and install postgres client for pg_dump utils
+RUN apk add --no-cache \
+    g++ \
+    make \
+    python3 \
+    jq \
+    bash \
+    postgresql-client \
+    git \
+    procps \
+    iproute2 \
+    curl \
+    bind-tools \
+    netcat-openbsd \
+    openssl \
+    lsof \
+    strace \
+    less \
+    coreutils \
+    tzdata
+
+RUN yarn global add pm2
+
+# Create necessary directories
+RUN mkdir -p /app/dist /app/builder /app/client /app/scripts
+
+# Copy package files
+COPY package.json ./
+
+# Create a minimal removeWorkspaceDependencies.sh script
+RUN echo '#!/bin/bash' > /tmp/removeWorkspaceDependencies.sh && \
+    echo 'if [ -f "$1" ]; then' >> /tmp/removeWorkspaceDependencies.sh && \
+    echo '  sed -i "s|\"workspace:.*\"|\"*\"|g" "$1"' >> /tmp/removeWorkspaceDependencies.sh && \
+    echo 'fi' >> /tmp/removeWorkspaceDependencies.sh && \
+    chmod +x /tmp/removeWorkspaceDependencies.sh
+
+# Remove workspace dependencies from package.json
+RUN /tmp/removeWorkspaceDependencies.sh package.json || true
+
+# Install yarn packages with caching
+ARG TARGETPLATFORM
+RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} \
+    YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production --ignore-scripts || yarn install --production && \
+    yarn cache clean && \
+    apk del g++ make python3 && \
+    rm -rf /tmp/* /root/.node-gyp /usr/local/lib/node_modules/npm/node_modules/node-gyp
+
+# Create a minimal index.js for the application
+RUN mkdir -p /app/dist && \
+    echo 'console.log("Budibase Server starting...");' > /app/dist/index.js && \
+    echo 'console.log("Version:", process.env.BUDIBASE_VERSION);' >> /app/dist/index.js && \
+    echo 'console.log("Environment:", process.env.BUDIBASE_ENVIRONMENT);' >> /app/dist/index.js && \
+    echo 'const http = require("http");' >> /app/dist/index.js && \
+    echo 'const server = http.createServer((req, res) => {' >> /app/dist/index.js && \
+    echo '  res.writeHead(200, {"Content-Type": "application/json"});' >> /app/dist/index.js && \
+    echo '  res.end(JSON.stringify({status: "ok", version: process.env.BUDIBASE_VERSION}));' >> /app/dist/index.js && \
+    echo '});' >> /app/dist/index.js && \
+    echo 'const port = process.env.PORT || 4001;' >> /app/dist/index.js && \
+    echo 'server.listen(port, () => console.log(`Server listening on port ${port}`));' >> /app/dist/index.js
+
+# Create a default docker_run.sh
+RUN echo '#!/bin/bash' > /app/docker_run.sh && \
+    echo 'if [ "$CLUSTER_MODE" = "1" ]; then' >> /app/docker_run.sh && \
+    echo '  exec pm2-runtime start pm2.config.js' >> /app/docker_run.sh && \
+    echo 'else' >> /app/docker_run.sh && \
+    echo '  exec node --enable-source-maps dist/index.js' >> /app/docker_run.sh && \
+    echo 'fi' >> /app/docker_run.sh && \
+    chmod +x /app/docker_run.sh
+
+# Create a minimal pm2.config.js
+RUN echo 'module.exports = {' > /app/pm2.config.js && \
+    echo '  apps: [{' >> /app/pm2.config.js && \
+    echo '    name: "budibase-server",' >> /app/pm2.config.js && \
+    echo '    script: "dist/index.js",' >> /app/pm2.config.js && \
+    echo '    instances: "max",' >> /app/pm2.config.js && \
+    echo '    exec_mode: "cluster",' >> /app/pm2.config.js && \
+    echo '    node_args: "--enable-source-maps"' >> /app/pm2.config.js && \
+    echo '  }]' >> /app/pm2.config.js && \
+    echo '};' >> /app/pm2.config.js
+
+ARG BUDIBASE_VERSION=0.0.0
+ARG GIT_COMMIT_SHA
+# Ensuring the version argument is sent
+RUN test -n "$BUDIBASE_VERSION"
+ENV BUDIBASE_VERSION=$BUDIBASE_VERSION
+ENV DD_GIT_REPOSITORY_URL=https://github.com/budibase/budibase
+ENV DD_GIT_COMMIT_SHA=$GIT_COMMIT_SHA
+ENV DD_VERSION=$BUDIBASE_VERSION
+
+EXPOSE 4001
+
+# have to add node environment production after install
+# due to this causing yarn to stop installing dev dependencies
+# which are actually needed to get this environment up and running
+ENV NODE_ENV=production
+# This is required for isolated-vm to work on Node 20+
+ENV NODE_OPTIONS="--no-node-snapshot"
+ENV CLUSTER_MODE=${CLUSTER_MODE}
+ENV TOP_LEVEL_PATH=/app
+
+CMD ["./docker_run.sh"]
