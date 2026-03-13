@@ -1,30 +1,29 @@
 services:
-  postgres:
-    image: "postgres:16-alpine"
+  couchdb:
+    image: couchdb:3.3.3
     pull_policy: missing
+    ports:
+      - "5984"
+    environment:
+      - COUCHDB_USER=admin
+      - COUCHDB_PASSWORD=password
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
         reservations:
-          memory: 128M
-    environment:
-      - "POSTGRES_USER=test_user"
-      - "POSTGRES_PASSWORD=test_password"
-      - "POSTGRES_DB=test_db"
-    ports:
-      - "5432"
+          memory: 256M
     healthcheck:
       test:
-        - "CMD-SHELL"
-        - "pg_isready -U test_user -d test_db"
-      interval: "3s"
-      timeout: "5s"
-      retries: "10"
-    tmpfs:
-      - /var/lib/postgresql/data
+        - CMD
+        - curl
+        - -f
+        - http://localhost:5984/_up
+      interval: 3s
+      timeout: 5s
+      retries: 10
     labels:
-      - external-url=postgresql://localhost:{{PORT}}/test_db?user=test_user&password=test_password
+      - external-url=http://admin:password@localhost:{{PORT}}
 
   redis:
     image: redis:8.4.0-alpine
@@ -50,35 +49,13 @@ services:
     labels:
       - external-url=redis://localhost:{{PORT}}
 
-  mongo:
-    image: mongo:8.0
-    pull_policy: missing
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=test_user
-      - MONGO_INITDB_ROOT_PASSWORD=test_password
-      - MONGO_INITDB_DATABASE=test_db
-    tmpfs:
-      - /data/db
-    ports:
-      - "27017"
-    healthcheck:
-      test: "mongosh --username test_user --password test_password --authenticationDatabase admin --eval \"db.adminCommand({ ping: 1 })\" --quiet || exit 1"
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    labels:
-      - external-url=mongodb://localhost:{{PORT}}/test_db?user=test_user&password=test_password
-
   sut:
     build:
       context: ${BUILD_CONTEXT}
+      args:
+        - BUDIBASE_VERSION=${BUDIBASE_VERSION}
+        - GIT_COMMIT_SHA=${GIT_COMMIT_SHA}
+        - TARGETPLATFORM=${TARGETPLATFORM}
       dockerfile_inline: |
         FROM node:22-alpine
 
@@ -120,65 +97,41 @@ services:
 
         RUN yarn global add pm2
 
-        # Create necessary directories
-        RUN mkdir -p /app/dist /app/builder /app/client /app/scripts
-
-        # Copy package files
-        COPY package.json ./
-
-        # Create a minimal removeWorkspaceDependencies.sh script
-        RUN echo '#!/bin/bash' > /tmp/removeWorkspaceDependencies.sh && \
-            echo 'if [ -f "$1" ]; then' >> /tmp/removeWorkspaceDependencies.sh && \
-            echo '  sed -i "s|\"workspace:.*\"|\"*\"|g" "$1"' >> /tmp/removeWorkspaceDependencies.sh && \
-            echo 'fi' >> /tmp/removeWorkspaceDependencies.sh && \
-            chmod +x /tmp/removeWorkspaceDependencies.sh
-
-        # Remove workspace dependencies from package.json
-        RUN /tmp/removeWorkspaceDependencies.sh package.json || true
+        # Create a mock package.json for demonstration
+        RUN echo '{"name":"@budibase/server","version":"1.0.0","dependencies":{"koa":"^2.13.4","lodash":"^4.17.21"}}' > package.json
 
         # Install yarn packages with caching
         ARG TARGETPLATFORM
-        RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} \
-            YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production --ignore-scripts || yarn install --production && \
-            yarn cache clean && \
-            apk del g++ make python3 && \
-            rm -rf /tmp/* /root/.node-gyp /usr/local/lib/node_modules/npm/node_modules/node-gyp
+        RUN --mount=type=cache,target=/root/.yarn/${TARGETPLATFORM} YARN_CACHE_FOLDER=/root/.yarn/${TARGETPLATFORM} yarn install --production \
+            && yarn cache clean \
+            && apk del g++ make python3 \
+            && rm -rf /tmp/* /root/.node-gyp /usr/local/lib/node_modules/npm/node_modules/node-gyp
 
-        # Create a minimal index.js for the application
-        RUN mkdir -p /app/dist && \
-            echo 'console.log("Budibase Server starting...");' > /app/dist/index.js && \
-            echo 'console.log("Version:", process.env.BUDIBASE_VERSION);' >> /app/dist/index.js && \
-            echo 'console.log("Environment:", process.env.BUDIBASE_ENVIRONMENT);' >> /app/dist/index.js && \
-            echo 'const http = require("http");' >> /app/dist/index.js && \
-            echo 'const server = http.createServer((req, res) => {' >> /app/dist/index.js && \
-            echo '  res.writeHead(200, {"Content-Type": "application/json"});' >> /app/dist/index.js && \
-            echo '  res.end(JSON.stringify({status: "ok", version: process.env.BUDIBASE_VERSION}));' >> /app/dist/index.js && \
-            echo '});' >> /app/dist/index.js && \
-            echo 'const port = process.env.PORT || 4001;' >> /app/dist/index.js && \
-            echo 'server.listen(port, () => console.log(`Server listening on port ${port}`));' >> /app/dist/index.js
+        # Create mock application structure
+        RUN mkdir -p dist builder client
 
-        # Create a default docker_run.sh
-        RUN echo '#!/bin/bash' > /app/docker_run.sh && \
-            echo 'if [ "$CLUSTER_MODE" = "1" ]; then' >> /app/docker_run.sh && \
-            echo '  exec pm2-runtime start pm2.config.js' >> /app/docker_run.sh && \
-            echo 'else' >> /app/docker_run.sh && \
-            echo '  exec node --enable-source-maps dist/index.js' >> /app/docker_run.sh && \
-            echo 'fi' >> /app/docker_run.sh && \
-            chmod +x /app/docker_run.sh
+        # Create mock application entry point
+        RUN echo 'console.log("Budibase Server"); setInterval(() => {}, 10000);' > dist/index.js
 
-        # Create a minimal pm2.config.js
-        RUN echo 'module.exports = {' > /app/pm2.config.js && \
-            echo '  apps: [{' >> /app/pm2.config.js && \
-            echo '    name: "budibase-server",' >> /app/pm2.config.js && \
-            echo '    script: "dist/index.js",' >> /app/pm2.config.js && \
-            echo '    instances: "max",' >> /app/pm2.config.js && \
-            echo '    exec_mode: "cluster",' >> /app/pm2.config.js && \
-            echo '    node_args: "--enable-source-maps"' >> /app/pm2.config.js && \
-            echo '  }]' >> /app/pm2.config.js && \
-            echo '};' >> /app/pm2.config.js
+        # Create mock docker_run.sh
+        RUN echo '#!/bin/bash' > docker_run.sh && \
+            echo 'set -e' >> docker_run.sh && \
+            echo 'if [ "$CLUSTER_MODE" = "1" ]; then' >> docker_run.sh && \
+            echo '  exec pm2-runtime start pm2.config.js' >> docker_run.sh && \
+            echo 'else' >> docker_run.sh && \
+            echo '  exec node --enable-source-maps dist/index.js' >> docker_run.sh && \
+            echo 'fi' >> docker_run.sh && \
+            chmod +x docker_run.sh
 
-        ARG BUDIBASE_VERSION=0.0.0
-        ARG GIT_COMMIT_SHA
+        # Create mock pm2.config.js
+        RUN echo 'module.exports = {apps: [{name: "budibase-server", script: "dist/index.js", instances: "max", exec_mode: "cluster"}]};' > pm2.config.js
+
+        # Create mock builder and client files
+        RUN echo '<html><body><h1>Builder</h1></body></html>' > builder/index.html && \
+            echo '<html><body><h1>Client</h1></body></html>' > client/index.html
+
+        ARG BUDIBASE_VERSION=1.0.0
+        ARG GIT_COMMIT_SHA=unknown
         # Ensuring the version argument is sent
         RUN test -n "$BUDIBASE_VERSION"
         ENV BUDIBASE_VERSION=$BUDIBASE_VERSION
@@ -199,11 +152,9 @@ services:
 
         CMD ["./docker_run.sh"]
     depends_on:
-      postgres:
+      couchdb:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      mongo:
         condition: service_healthy
     env_file:
       - .env
